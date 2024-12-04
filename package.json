@@ -1,0 +1,26 @@
+{
+  "name": "aissist",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "tsc ; electron . --no-sandbox",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "axios": "latest",
+    "desktop-screenshot": "latest",
+    "electron": "latest",
+    "form-data": "latest",
+    "node-fetch": "latest",
+    "node-global-key-listener": "latest",
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "@types/electron": "latest",
+    "@types/node": "latest",
+    "@types/screenshot-desktop": "latest",
+    "typescript": "latest"
+  },
+  "private": true
+}
