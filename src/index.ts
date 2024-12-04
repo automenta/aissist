@@ -479,19 +479,25 @@ class ElectronApp {
     }
 }
 
+const model =
+    'llava:7b'
+    //'hf.co/cjpais/llava-1.6-mistral-7b-gguf:Q4_K_M';
+
 class Config {
     visionOllamaUrl = Utils.getEnvString('VISION_OLLAMA_URL', 'http://localhost:11434/api/chat');
-    visionModel = Utils.getEnvString('VISION_MODEL', 'llava:7b');
+    visionModel = Utils.getEnvString('VISION_MODEL',
+        model
+    );
     nonVisionOllamaUrl = Utils.getEnvString('NON_VISION_OLLAMA_URL', 'http://localhost:11434/api/chat');
-    nonVisionModel = Utils.getEnvString('NON_VISION_MODEL', 'llava:7b');
+    nonVisionModel = Utils.getEnvString('NON_VISION_MODEL', model);
     historyLimit = Utils.getEnvNumber('HISTORY_LIMIT', 20);
     analysisInterval = Utils.getEnvNumber('ANALYSIS_INTERVAL', 10000);
     intentInferenceInterval = Utils.getEnvNumber('INTENT_INFERENCE_INTERVAL', 5);
     subRegion: Interfaces.SubRegion = {
         x: Utils.getEnvNumber('SUB_REGION_X', 0),
         y: Utils.getEnvNumber('SUB_REGION_Y', 0),
-        width: Utils.getEnvNumber('SUB_REGION_WIDTH', 1920),
-        height: Utils.getEnvNumber('SUB_REGION_HEIGHT', 1080)
+        width: Utils.getEnvNumber('SUB_REGION_WIDTH', 640/*1920*/),
+        height: Utils.getEnvNumber('SUB_REGION_HEIGHT', 480/*1080*/)
     };
     snapshotManager = new SnapshotManager(5, this.subRegion);
 }
