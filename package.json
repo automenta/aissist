@@ -10,11 +10,15 @@
   "dependencies": {
     "axios": "latest",
     "desktop-screenshot": "latest",
+    "dotenv": "latest",
     "electron": "latest",
     "form-data": "latest",
     "node-fetch": "latest",
     "node-global-key-listener": "latest",
-    "sharp": "^0.33.5"
+    "sharp": "latest",
+    "systeminformation": "latest",
+    "tesseract.js": "latest",
+    "@evgenys91/active-win": "latest"
   },
   "devDependencies": {
     "@types/electron": "latest",

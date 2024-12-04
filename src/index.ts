@@ -1,666 +1,682 @@
-import * as path from 'path';
-import * as fs from 'fs';
-import { EventEmitter } from 'events';
-import { app, BrowserWindow, ipcMain, Notification } from 'electron';
-import screenshot from 'screenshot-desktop';
+// main.ts
+import { app, BrowserWindow, Tray, Menu, ipcMain, Notification } from 'electron';
+import path from 'path';
 import axios from 'axios';
+import screenshotDesktop from 'screenshot-desktop';
+import sharp from 'sharp';
+import si from 'systeminformation';
+import activeWin, {Result} from '@evgenys91/active-win';
+import Tesseract from 'tesseract.js';
+import crypto from 'crypto';
+import { EventEmitter } from 'events';
+import fs from 'fs';
+import dotenv from 'dotenv';
+import ActiveWindowInfo = Interfaces.ActiveWindowInfo;
 
-const platform = process.platform; // 'win32', 'darwin', 'linux'
+// Load environment variables from .env file
+dotenv.config();
 
-interface ConfigSchema {
-    api: {
-        endpoint: string;
-        modelName: string;
-        apiKey?: string;
+/**
+ * Utility namespace containing helper functions and types.
+ */
+namespace Utils {
+    /**
+     * Pauses execution for a specified number of milliseconds.
+     * @param ms - Milliseconds to delay.
+     */
+    export const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+    /**
+     * Safely retrieves a numeric environment variable or returns a default value.
+     * @param key - The environment variable key.
+     * @param defaultValue - The default value if the environment variable is not set or invalid.
+     */
+    export const getEnvNumber = (key: string, defaultValue: number): number => {
+        const value = parseInt(process.env[key] || '');
+        return isNaN(value) ? defaultValue : value;
     };
-    assistant: {
-        captureInterval: number; // in seconds
-        screenshotBufferSize: number;
-        inputEventBufferSize: number;
+
+    /**
+     * Safely retrieves a string environment variable or returns a default value.
+     * @param key - The environment variable key.
+     * @param defaultValue - The default value if the environment variable is not set.
+     */
+    export const getEnvString = (key: string, defaultValue: string): string => {
+        return process.env[key] || defaultValue;
     };
-    logging: {
-        level: string;
-        file: string;
-    };
 }
 
-class ConfigurationManager {
-    private configPath: string;
-    private config: ConfigSchema;
-
-    constructor() {
-        this.configPath = path.join(app.getPath('userData'), 'config.json');
-        this.config = this.loadConfig();
+/**
+ * Interface definitions for various data structures used in the application.
+ */
+namespace Interfaces {
+    export interface SubRegion {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
     }
 
-    private loadConfig(): ConfigSchema {
-        if (fs.existsSync(this.configPath)) {
-            const data = fs.readFileSync(this.configPath, 'utf-8');
-            return JSON.parse(data) as ConfigSchema;
-        } else {
-            const defaultConfig: ConfigSchema = {
-                api: {
-                    endpoint: 'http://localhost:11434/api/generate',
-                    modelName: 'llama3.2-vision:11b',
-                    //modelName: 'llama3.2:1b',
-                    apiKey: '' // If authentication is required
-                },
-                assistant: {
-                    captureInterval: 15, // seconds
-                    screenshotBufferSize: 10,
-                    inputEventBufferSize: 100
-                },
-                logging: {
-                    level: 'debug',
-                    //level: 'info',
-                    file: 'assistant.log'
-                }
-            };
-            fs.writeFileSync(this.configPath, JSON.stringify(defaultConfig, null, 2));
-            return defaultConfig;
-        }
+    export interface ProcessInfo {
+        pid: number;
+        name: string;
+        cpu: number;
+        memory: number;
     }
 
-    public getConfig(): ConfigSchema {
-        return this.config;
-    }
-}
-
-// -------------------------- Logger -------------------------- //
-
-enum LogLevel {
-    DEBUG = 'debug',
-    INFO = 'info',
-    WARNING = 'warning',
-    ERROR = 'error'
-}
-
-class Logger {
-    private logStream: fs.WriteStream;
-    private level: LogLevel;
-
-    constructor(logFilePath: string, level: string) {
-        this.logStream = fs.createWriteStream(logFilePath, { flags: 'a' });
-        this.level = level.toLowerCase() as LogLevel;
+    export interface ActiveWindowInfo {
+        title: string;
+        owner: string;
+        processId: number;
     }
 
-    private shouldLog(level: LogLevel): boolean {
-        const levels = [LogLevel.DEBUG, LogLevel.INFO, LogLevel.WARNING, LogLevel.ERROR];
-        return levels.indexOf(level) >= levels.indexOf(this.level);
+    export interface OCRResult {
+        text: string;
+        confidence: number;
     }
 
-    public log(level: LogLevel, message: string): void {
-        if (this.shouldLog(level)) {
-            const timestamp = new Date().toISOString();
-            const logMessage = `${timestamp} - ${level.toUpperCase()}: ${message}\n`;
-            this.logStream.write(logMessage);
-            console.log(logMessage.trim());
-        }
+    export interface LLMAnalysis {
+        content: string;
     }
 
-    public debug(message: string): void {
-        this.log(LogLevel.DEBUG, message);
+    export interface Snapshot {
+        timestamp: Date;
+        processes: ProcessInfo[];
+        activeWindow: ActiveWindowInfo;
+        screenshot: Buffer;
+        ocrResult: OCRResult;
+        llmAnalysis: LLMAnalysis;
+        isDuplicate: boolean;
     }
 
-    public info(message: string): void {
-        this.log(LogLevel.INFO, message);
+    export interface NotificationPayload {
+        type: NotificationType;
+        message: string;
     }
 
-    public warning(message: string): void {
-        this.log(LogLevel.WARNING, message);
-    }
-
-    public error(message: string): void {
-        this.log(LogLevel.ERROR, message);
+    export enum NotificationType {
+        Intentions = 'intentions',
+        Error = 'error',
+        Paused = 'paused',
+        Resumed = 'resumed'
     }
 }
 
-// -------------------------- Input Event Manager -------------------------- //
+/**
+ * Collects information about system processes.
+ */
+class ProcessCollector {
+    private readonly topN: number;
 
-interface InputEvent {
-    type: string;
-    details: string;
-    timestamp: number;
-}
-
-class InputEventManager extends EventEmitter {
-    private inputEvents: InputEvent[] = [];
-    private bufferSize: number;
-    private logger: Logger;
-
-    // Platform-specific listeners
-    private keyboardListener: any;
-    private mouseListener: any;
-
-    constructor(bufferSize: number, logger: Logger) {
-        super();
-        this.bufferSize = bufferSize;
-        this.logger = logger;
-        this.initializeListeners();
+    constructor(topN: number = 5) {
+        this.topN = topN;
     }
 
-    private initializeListeners(): void {
+    /**
+     * Collects the top N processes by CPU and memory usage.
+     * @returns An array of ProcessInfo objects.
+     */
+    async collect(): Promise<Interfaces.ProcessInfo[]> {
+        const procs = await si.processes();
+        const byCPU = [...procs.list].sort((a, b) => b.cpu - a.cpu).slice(0, this.topN);
+        const byMem = [...procs.list].sort((a, b) => b.memRss - a.memRss).slice(0, this.topN);
+
+        const combined = [...byCPU, ...byMem];
+        return Array.from(new Map(combined.map(p => [p.pid, {
+            pid: p.pid,
+            name: p.name,
+            cpu: parseFloat(p.cpu.toFixed(2)),
+            memory: parseFloat((p.memRss / (1024 * 1024)).toFixed(2))
+        }])).values());
+    }
+}
+
+/**
+ * Collects information about the currently active window.
+ */
+class WindowCollector {
+    /**
+     * Collects active window information.
+     * @returns An ActiveWindowInfo object.
+     */
+    async collect(): Promise<Interfaces.ActiveWindowInfo> {
         try {
-            if (platform === 'linux') {
-                // Linux: Use the provided mouse listener code
-                this.mouseListener = new LinuxMouseListener(this.logger);
-                this.mouseListener.on('button', (event: any) => {
-                    this.addEvent({
-                        type: 'mouse_click',
-                        details: `Button ${event.button} at (${event.x}, ${event.y})`,
-                        timestamp: event.timestamp
-                    });
-                    this.logger.debug(`Mouse clicked: Button ${event.button} at (${event.x}, ${event.y})`);
-                });
-
-                this.mouseListener.on('moved', (event: any) => {
-                    this.addEvent({
-                        type: 'mouse_moved',
-                        details: `Moved by (${event.xDelta}, ${event.yDelta})`,
-                        timestamp: event.timestamp
-                    });
-                    this.logger.debug(`Mouse moved: Delta (${event.xDelta}, ${event.yDelta})`);
-                });
-
-                this.mouseListener.start();
-
-                // Keyboard Listener: Use an alternative library or implement a simple key logger
-                // For demonstration, we'll use 'readline' to capture key presses from the terminal
-                // In a real-world scenario, you'd use a proper key logger library compatible with Linux
-                // WARNING: Implementing a key logger can have security and privacy implications
-
-                const readline = require('readline');
-                readline.emitKeypressEvents(process.stdin);
-                if (process.stdin.isTTY) {
-                    process.stdin.setRawMode(true);
-                    process.stdin.on('keypress', (str: string, key: any) => {
-                        if (key.sequence === '\u0003') { // Ctrl+C to exit
-                            process.exit();
-                        }
-                        this.addEvent({
-                            type: 'key_press',
-                            details: `Key ${key.name}`,
-                            timestamp: Date.now()
-                        });
-                        this.logger.debug(`Key pressed: ${key.name}`);
-                    });
-                    this.logger.info('Keyboard listener initialized.');
-                }
-
-                this.logger.info('Linux input listeners initialized.');
+            const y:Result|undefined  = await activeWin();
+            if (!y) {
+                return { title: 'Unknown', owner: 'Unknown', processId: -1 };
             } else {
-                this.logger.error(`Unsupported platform: ${platform}`);
-                throw new Error(`Unsupported platform: ${platform}`);
+                return {
+                    title: y.title || 'No Title',
+                    owner: y.owner?.name || 'Unknown',
+                    processId: y.id || -1
+                };
             }
-        } catch (error: any) {
-            this.logger.error(`Error initializing input listeners: ${error.message || error}`);
+        } catch (error) {
+            console.error('Error collecting active window:', error, '\nIs "xwininfo" installed?');
+            return { title: 'Error', owner: 'Error', processId: -1 };
+        }
+    }
+}
+
+/**
+ * Performs OCR on images.
+ */
+class OCRCollector {
+    /**
+     * Performs OCR on the provided image buffer.
+     * @param imageBuffer - The image buffer to process.
+     * @returns An OCRResult object.
+     */
+    async collect(imageBuffer: Buffer): Promise<Interfaces.OCRResult> {
+        try {
+            const { data } = await Tesseract.recognize(imageBuffer, 'eng', { logger: () => {} });
+            return { text: data.text.trim(), confidence: data.confidence };
+        } catch (error) {
+            console.error('OCR error:', error);
+            return { text: '', confidence: 0 };
+        }
+    }
+}
+
+/**
+ * Detects duplicate screenshots based on their hash.
+ */
+class DuplicateDetector {
+    private previousHash: string | null = null;
+
+    /**
+     * Computes the SHA-256 hash of a buffer.
+     * @param buffer - The buffer to hash.
+     * @returns The hexadecimal hash string.
+     */
+    computeHash(buffer: Buffer): string {
+        return crypto.createHash('sha256').update(buffer).digest('hex');
+    }
+
+    /**
+     * Determines if the provided buffer is a duplicate of the previous one.
+     * @param buffer - The buffer to check.
+     * @returns True if duplicate, else false.
+     */
+    isDuplicate(buffer: Buffer): boolean {
+        const currentHash = this.computeHash(buffer);
+        if (this.previousHash === currentHash) {
+            return true;
+        }
+        this.previousHash = currentHash;
+        return false;
+    }
+}
+
+/**
+ * Manages the creation of snapshots containing various system and user data.
+ */
+class SnapshotManager {
+    private processCollector: ProcessCollector;
+    private windowCollector: WindowCollector;
+    private ocrCollector: OCRCollector;
+    private duplicateDetector: DuplicateDetector;
+    private subRegion?: Interfaces.SubRegion;
+
+    constructor(topNProcesses: number = 5, subRegion?: Interfaces.SubRegion) {
+        this.processCollector = new ProcessCollector(topNProcesses);
+        this.windowCollector = new WindowCollector();
+        this.ocrCollector = new OCRCollector();
+        this.duplicateDetector = new DuplicateDetector();
+        this.subRegion = subRegion;
+    }
+
+    /**
+     * Captures a screenshot, optionally cropping to a subregion.
+     * @returns A Buffer containing the screenshot image.
+     */
+    private async captureScreenshot(): Promise<Buffer> {
+        const screenshotBuffer = await screenshotDesktop({ format: 'png' });
+        if (this.subRegion) {
+            const { x, y, width, height } = this.subRegion;
+            return await sharp(screenshotBuffer)
+                .extract({ left: x, top: y, width, height })
+                .png()
+                .toBuffer();
+        }
+        return screenshotBuffer;
+    }
+
+    /**
+     * Creates a snapshot containing system and user data.
+     * @returns A Snapshot object.
+     */
+    async createSnapshot(): Promise<Interfaces.Snapshot> {
+        try {
+            const screenshotBuffer = await this.captureScreenshot();
+            const isDuplicate = this.duplicateDetector.isDuplicate(screenshotBuffer);
+            if (isDuplicate) {
+                return {
+                    timestamp: new Date(),
+                    processes: [],
+                    activeWindow: { title: '', owner: '', processId: -1 },
+                    screenshot: screenshotBuffer,
+                    ocrResult: { text: '', confidence: 0 },
+                    llmAnalysis: { content: '' },
+                    isDuplicate: true
+                };
+            }
+            const [processes, activeWindow, ocrResult] = await Promise.all([
+                this.processCollector.collect(),
+                this.windowCollector.collect(),
+                this.ocrCollector.collect(screenshotBuffer)
+            ]);
+            return {
+                timestamp: new Date(),
+                processes,
+                activeWindow,
+                screenshot: screenshotBuffer,
+                ocrResult,
+                llmAnalysis: { content: '' },
+                isDuplicate: false
+            };
+        } catch (error) {
+            console.error('Error creating snapshot:', error);
             throw error;
         }
     }
-
-    private addEvent(event: InputEvent): void {
-        this.inputEvents.push(event);
-        if (this.inputEvents.length > this.bufferSize)
-            this.inputEvents.shift();
-
-        this.emit('eventAdded', event);
-    }
-
-    public getEvents(): InputEvent[] {
-        return [...this.inputEvents];
-    }
-
-    public clearEvents(): void {
-        this.inputEvents = [];
-    }
 }
-
-// -------------------------- Linux Mouse Listener -------------------------- //
 
 /**
- * Read Linux mouse(s) in node.js
- * Author: Marc Loehe (marcloehe@gmail.com)
- *
- * Adapted from Tim Caswell's nice solution to read a linux joystick
- * http://nodebits.org/linux-joystick
- * https://github.com/nodebits/linux-joystick
+ * Analyzes snapshots using LLMs and infers user intentions.
  */
+class ScreenshotAnalyzer extends EventEmitter {
+    private visionOllamaUrl: string;
+    private visionModel: string;
+    private nonVisionOllamaUrl: string;
+    private nonVisionModel: string;
+    private history: Interfaces.Snapshot[] = [];
+    private historyLimit: number;
+    private analysisInterval: number;
+    private intentInferenceInterval: number;
+    private snapshotManager: SnapshotManager;
+    private isPaused: boolean = false;
 
-class LinuxMouseListener extends EventEmitter {
-    private fs = require('fs');
-    private dev: string;
-    private fd: number | undefined;
-    private buf: Buffer;
-
-    constructor(private logger: Logger, mouseid?: number) {
+    constructor(
+        visionOllamaUrl: string,
+        visionModel: string,
+        nonVisionOllamaUrl: string,
+        nonVisionModel: string,
+        historyLimit: number = 20,
+        analysisInterval: number = 10000,
+        intentInferenceInterval: number = 5,
+        snapshotManager: SnapshotManager
+    ) {
         super();
-        this.dev = typeof(mouseid) === 'number' ? `mouse${mouseid}` : 'mice';
-        this.buf = Buffer.alloc(3);
+        this.visionOllamaUrl = visionOllamaUrl;
+        this.visionModel = visionModel;
+        this.nonVisionOllamaUrl = nonVisionOllamaUrl;
+        this.nonVisionModel = nonVisionModel;
+        this.historyLimit = historyLimit;
+        this.analysisInterval = analysisInterval;
+        this.intentInferenceInterval = intentInferenceInterval;
+        this.snapshotManager = snapshotManager;
     }
 
-    public start(): void {
-        this.fs.open(`/dev/input/${this.dev}`, 'r', (err: any, fd: number) => {
-            if (err) {
-                this.logger.error(`Failed to open ${this.dev}: ${err.message}`);
-                this.emit('error', err);
-                return;
-            }
-            this.fd = fd;
-            this.logger.info(`Opened ${this.dev} for reading.`);
-            this.startRead();
-        });
-    }
+    /**
+     * Analyzes a snapshot using the vision LLM.
+     * @param snapshot - The snapshot to analyze.
+     */
+    async analyzeSnapshot(snapshot: Interfaces.Snapshot): Promise<void> {
+        if (snapshot.isDuplicate) return;
 
-    private startRead(): void {
-        if (this.fd === undefined) return;
-        this.fs.read(this.fd, this.buf, 0, 3, null, (err: any, bytesRead: number, buffer: Buffer) => {
-            if (err) {
-                this.logger.error(`Error reading from ${this.dev}: ${err.message}`);
-                this.emit('error', err);
-                return;
-            }
-            if (bytesRead === 3) {
-                const event = this.parse(buffer);
-                this.emit(event.type, event);
-            }
-            this.startRead(); // Continue reading
-        });
-    }
-
-    private parse(buffer: Buffer): any {
-        const event:any = {
-            leftBtn: (buffer[0] & 1) > 0,    // Bit 0
-            rightBtn: (buffer[0] & 2) > 0,   // Bit 1
-            middleBtn: (buffer[0] & 4) > 0,  // Bit 2
-            xSign: (buffer[0] & 16) > 0,     // Bit 4
-            ySign: (buffer[0] & 32) > 0,     // Bit 5
-            xOverflow: (buffer[0] & 64) > 0, // Bit 6
-            yOverflow: (buffer[0] & 128) > 0,// Bit 7
-            xDelta: buffer.readInt8(1),       // Byte 2 as signed int
-            yDelta: buffer.readInt8(2)        // Byte 3 as signed int
-        };
-        event.type = event.leftBtn || event.rightBtn || event.middleBtn ? 'button' : 'moved';
-        return event;
-    }
-
-    public close(): void {
-        if (this.fd !== undefined) {
-            this.fs.close(this.fd, (err: any) => {
-                if (err)
-                    this.logger.error(`Error closing ${this.dev}: ${err.message}`);
-                else
-                    this.logger.info(`Closed ${this.dev}.`);
+        const base64Image = snapshot.screenshot.toString('base64');
+        try {
+            const response = await axios.post(this.visionOllamaUrl, {
+                model: this.visionModel,
+                messages: [
+                    {
+                        role: 'user',
+                        content: 'Analyze the user context based on the provided data.',
+                        images: [base64Image]
+                    }
+                ],
+                stream: false
             });
-            this.fd = undefined;
+
+            // Validate response structure
+            if (response.data?.message?.content) {
+                snapshot.llmAnalysis.content = response.data.message.content;
+            } else {
+                snapshot.llmAnalysis.content = 'Invalid response structure.';
+                console.error('Invalid response structure from vision LLM:', response.data);
+            }
+        } catch (error) {
+            console.error('Error analyzing snapshot with vision LLM:', error);
+            snapshot.llmAnalysis.content = 'Analysis failed.';
         }
     }
-}
 
-// -------------------------- Screenshot Manager -------------------------- //
-
-class ScreenshotManager {
-    private screenshotBuffer: Buffer[] = [];
-    private bufferSize: number;
-    private logger: Logger;
-
-    constructor(bufferSize: number, logger: Logger) {
-        this.bufferSize = bufferSize;
-        this.logger = logger;
-    }
-
-    public async captureScreenshot(): Promise<void> {
+    /**
+     * Sends a prompt to the non-vision LLM to reason about user activity.
+     * @param prompt - The prompt to send.
+     * @returns The LLM's response as a string.
+     */
+    async reasonUserActivity(prompt: string): Promise<string> {
         try {
-            const img = await screenshot({ format: 'png' });
-            this.screenshotBuffer.push(img);
-            if (this.screenshotBuffer.length > this.bufferSize)
-                this.screenshotBuffer.shift();
+            const response = await axios.post(this.nonVisionOllamaUrl, {
+                model: this.nonVisionModel,
+                messages: [{ role: 'user', content: prompt }],
+                stream: false
+            });
 
-            this.logger.debug('Screenshot captured and added to buffer.');
-        } catch (error: any) {
-            this.logger.error(`Error capturing screenshot: ${error.message || error}`);
+            // Validate response structure
+            if (response.data?.message?.content) {
+                return response.data.message.content;
+            } else {
+                console.error('Invalid response structure from non-vision LLM:', response.data);
+                return 'Invalid response from reasoning LLM.';
+            }
+        } catch (error) {
+            console.error('Error reasoning user activity:', error);
+            return 'Reasoning failed.';
         }
     }
 
-    public getLatestScreenshot(): Buffer | null {
-        return this.screenshotBuffer.length === 0 ? null :
-            this.screenshotBuffer[this.screenshotBuffer.length - 1];
+    /**
+     * Infers user intentions based on the history of LLM analyses.
+     * @returns A string describing the inferred user intentions.
+     */
+    async inferUserIntentions(): Promise<string> {
+        const prompts = this.history
+            .filter(s => !s.isDuplicate)
+            .map((s, i) => `Snapshot ${i + 1}:\n${s.llmAnalysis.content}`)
+            .join('\n\n');
+        const combinedPrompt = `Based on the following user context analyses, infer the user's current intentions or goals:\n\n${prompts}\n\nUser Intentions:`;
+        return await this.reasonUserActivity(combinedPrompt);
+    }
+
+    /**
+     * Starts the analysis loop.
+     */
+    async run(): Promise<void> {
+        while (true) {
+            if (!this.isPaused) {
+                try {
+                    const snapshot = await this.snapshotManager.createSnapshot();
+                    if (!snapshot.isDuplicate) {
+                        await this.analyzeSnapshot(snapshot);
+                    }
+                    this.history.push(snapshot);
+                    if (this.history.length > this.historyLimit) this.history.shift();
+
+                    if (this.history.length > 0 && this.history.length % this.intentInferenceInterval === 0) {
+                        const intentions = await this.inferUserIntentions();
+                        this.emit('notification', { type: Interfaces.NotificationType.Intentions, message: intentions });
+                    }
+                } catch (error:any) {
+                    console.error('Error during analysis loop:', error);
+                    this.emit('notification', { type: Interfaces.NotificationType.Error, message: `Error during analysis loop: ${error.message || error}` });
+                }
+            }
+            await Utils.delay(this.analysisInterval);
+        }
+    }
+
+    /**
+     * Pauses the analysis loop.
+     */
+    pause(): void {
+        if (!this.isPaused) {
+            this.isPaused = true;
+            this.emit('notification', { type: Interfaces.NotificationType.Paused, message: 'Data collection paused.' });
+        }
+    }
+
+    /**
+     * Resumes the analysis loop.
+     */
+    resume(): void {
+        if (this.isPaused) {
+            this.isPaused = false;
+            this.emit('notification', { type: Interfaces.NotificationType.Resumed, message: 'Data collection resumed.' });
+        }
     }
 }
 
-// -------------------------- Intent Inference Service -------------------------- //
-
-class IntentInferenceService {
-    private apiEndpoint: string;
-    private modelName: string;
-    private apiKey?: string;
-    private logger: Logger;
-
-    constructor(apiEndpoint: string, modelName: string, apiKey: string | undefined, logger: Logger) {
-        this.apiEndpoint = apiEndpoint;
-        this.modelName = modelName;
-        this.apiKey = apiKey;
-        this.logger = logger;
-    }
-
-    private formatEvents(events: InputEvent[]): string {
-        return events.map(event => `${event.type}: ${event.details}`).join('; ');
-    }
-
-    private cleanIntent(intentRaw: string): string {
-        return intentRaw.split('\n')[0];
-    }
-
-    public async inferIntent(screenshot: Buffer | null, events: InputEvent[]): Promise<string> {
-        if (!screenshot) {
-            this.logger.warning('No screenshot available for intent inference.');
-            return 'No screenshot available.';
-        }
-
-        const imgBase64 = screenshot.toString('base64');
-        const formattedEvents = this.formatEvents(events);
-
-        const prompt = `User has performed the following actions: ${formattedEvents}\nCurrent screen context: [IMAGE]\nInfer the user's intent based on the above information.`;
-
-        const data = {
-            model: this.modelName,
-            prompt: prompt,
-            images: [imgBase64],
-            stream: false
-        };
-
-        const headers: any = {
-            'Content-Type': 'application/json',
-        };
-
-        if (this.apiKey && this.apiKey.trim() !== '')
-            headers['Authorization'] = `Bearer ${this.apiKey}`;
-
-        try {
-            console.log(prompt);
-            const response = await axios.post(this.apiEndpoint, data, { headers, timeout: 30000 });
-            console.log(response);
-            const responseData = response.data;
-            const intentRaw = responseData.response || 'No response from model';
-            const intent = this.cleanIntent(intentRaw);
-            this.logger.info(`Inferred intent: ${intent}`);
-            return intent;
-        } catch (error: any) {
-            this.logger.error(`Error inferring intent: ${error.message || error}`);
-            return `Error inferring intent: ${error.message || error}`;
-        }
-    }
-}
-
-// -------------------------- Assistant Engine -------------------------- //
-
-class AssistantEngine {
-    private notificationHandler: (message: string) => void;
-    private logger: Logger;
-
-    constructor(notificationHandler: (message: string) => void, logger: Logger) {
-        this.notificationHandler = notificationHandler;
-        this.logger = logger;
-    }
-
-    public handleIntent(intent: string): void {
-        let message = '';
-        const lowerIntent = intent.toLowerCase();
-
-        if (lowerIntent.includes('writing an email')) {
-            message = "It looks like you're writing an email. Do you need a template or grammar suggestions?";
-        } else if (lowerIntent.includes('browsing the web')) {
-            message = "You're browsing the web. Would you like to organize your bookmarks or manage tabs?";
-        } else if (lowerIntent.includes('editing a document')) {
-            message = "Editing a document detected. Would you like assistance with formatting or citations?";
-        } else {
-            message = `Current intent: ${intent}`;
-        }
-
-        this.notificationHandler(message);
-        this.logger.info(`Assistant Engine processed intent: ${intent}`);
-    }
-}
-
-// -------------------------- GUI Manager -------------------------- //
-
-class GUIManager {
+/**
+ * Manages the Electron application, including windows and tray.
+ */
+class ElectronApp {
     private mainWindow: BrowserWindow | null = null;
-    private eventEmitter: EventEmitter;
+    private tray: Tray | null = null;
+    private analyzer: ScreenshotAnalyzer;
+    private config: Config;
 
-    constructor() {
-        this.eventEmitter = new EventEmitter();
-        this.createWindow();
-        this.setupIPC();
+    constructor(config: Config) {
+        this.config = config;
+        this.analyzer = new ScreenshotAnalyzer(
+            config.visionOllamaUrl,
+            config.visionModel,
+            config.nonVisionOllamaUrl,
+            config.nonVisionModel,
+            config.historyLimit,
+            config.analysisInterval,
+            config.intentInferenceInterval,
+            config.snapshotManager
+        );
+
+        this.setupEventListeners();
     }
 
+    /**
+     * Sets up event listeners for the analyzer.
+     */
+    private setupEventListeners(): void {
+        this.analyzer.on('notification', (payload: Interfaces.NotificationPayload) => {
+            this.showNotification(payload);
+            this.updateStatusInWindow(payload);
+        });
+    }
+
+    /**
+     * Creates the main application window.
+     */
     private createWindow(): void {
         this.mainWindow = new BrowserWindow({
-            width: 600,
-            height: 400,
+            width: 400,
+            height: 300,
             webPreferences: {
-                preload: path.join(__dirname, 'preload.js'), // If needed
-                nodeIntegration: true,
-                contextIsolation: false,
+                preload: path.join(__dirname, 'preload.js'), // Ensure preload.js is correctly set up
+                contextIsolation: true,
+                nodeIntegration: false
             },
-            resizable: false,
+            show: false
         });
 
-        // Load HTML content
-        this.mainWindow.loadURL(`data:text/html,
-      <html>
-        <head>
-          <title>AI Assistant Status</title>
-          <style>
-            body { font-family: Arial, sans-serif; padding: 20px; }
-            h1 { text-align: center; }
-            .status { margin: 20px 0; }
-            .label { font-weight: bold; }
-            #exitButton { padding: 10px 20px; font-size: 16px; }
-          </style>
-        </head>
-        <body>
-          <h1>AI Assistant Status</h1>
-          <div class="status">
-            <div><span class="label">AI Assistant:</span> Active</div>
-            <div><span class="label">Current Intent:</span> <span id="intent">None</span></div>
-            <div><span class="label">Last Notification:</span> <span id="notification">None</span></div>
-          </div>
-          <button id="exitButton">Exit</button>
-          <script>
-            const { ipcRenderer } = require('electron');
-            document.getElementById('exitButton').addEventListener('click', () => {
-              ipcRenderer.send('exit-app');
-            });
+        this.mainWindow.loadFile(path.join(__dirname, 'control-panel.html'));
 
-            ipcRenderer.on('update-intent', (event, intent) => {
-              document.getElementById('intent').innerText = intent;
-            });
-
-            ipcRenderer.on('update-notification', (event, notification) => {
-              document.getElementById('notification').innerText = notification;
-            });
-          </script>
-        </body>
-      </html>
-    `);
-
-        this.mainWindow.on('closed', () => {
-            this.mainWindow = null;
+        this.mainWindow.on('close', (e) => {
+            e.preventDefault();
+            this.mainWindow?.hide();
         });
     }
 
-    private setupIPC(): void {
-        ipcMain.on('exit-app', () => {
-            this.eventEmitter.emit('exit');
+    /**
+     * Creates the system tray icon and context menu.
+     */
+    private createTray(): void {
+        const iconPath = path.join('/home/me/d/doom.png');
+        if (!fs.existsSync(iconPath)) {
+            console.error(`Tray icon not found at path: ${iconPath}`);
+        }
+
+        this.tray = new Tray(iconPath);
+        this.updateTrayMenu(false);
+
+        this.tray.setToolTip('Screenshot Analyzer');
+
+        this.tray.on('click', () => {
+            if (this.mainWindow) {
+                this.mainWindow.isVisible() ? this.mainWindow.hide() : this.mainWindow.show();
+            }
         });
     }
 
-    public updateIntent(intent: string): void {
+    /**
+     * Updates the tray context menu based on the current state.
+     * @param isPaused - Indicates whether the analysis is paused.
+     */
+    private updateTrayMenu(isPaused: boolean): void {
+        const contextMenu = Menu.buildFromTemplate([
+            { label: 'Open Control Panel', click: () => { this.mainWindow?.show(); } },
+            { type: 'separator' },
+            {
+                label: isPaused ? 'Resume Analysis' : 'Pause Analysis',
+                click: () => {
+                    if (isPaused) {
+                        this.analyzer.resume();
+                    } else {
+                        this.analyzer.pause();
+                    }
+                    this.updateTrayMenu(!isPaused);
+                }
+            },
+            { type: 'separator' },
+            { label: 'Quit', click: () => { app.quit(); } }
+        ]);
+        this.tray?.setContextMenu(contextMenu);
+    }
+
+    /**
+     * Displays a system notification.
+     * @param payload - The notification payload containing type and message.
+     */
+    private showNotification(payload: Interfaces.NotificationPayload): void {
+        new Notification({ title: 'Screenshot Analyzer', body: payload.message }).show();
+    }
+
+    /**
+     * Updates the status displayed in the main window.
+     * @param payload - The notification payload containing type and message.
+     */
+    private updateStatusInWindow(payload: Interfaces.NotificationPayload): void {
         if (this.mainWindow) {
-            this.mainWindow.webContents.send('update-intent', intent);
+            let status = '';
+            switch (payload.type) {
+                case Interfaces.NotificationType.Paused:
+                    status = 'Paused';
+                    break;
+                case Interfaces.NotificationType.Resumed:
+                    status = 'Running';
+                    break;
+                case Interfaces.NotificationType.Intentions:
+                    status = `Intentions: ${payload.message}`;
+                    break;
+                case Interfaces.NotificationType.Error:
+                    status = `Error: ${payload.message}`;
+                    break;
+                default:
+                    status = payload.message;
+            }
+            this.mainWindow.webContents.send('status-update', status);
         }
     }
 
-    public updateNotification(notification: string): void {
-        if (this.mainWindow) {
-            this.mainWindow.webContents.send('update-notification', notification);
-        }
+    /**
+     * Initializes and starts the Electron application.
+     */
+    init(): void {
+        app.whenReady().then(() => {
+            this.createWindow();
+            this.createTray();
+
+            // Start the analyzer loop
+            this.analyzer.run();
+
+            app.on('activate', () => {
+                if (BrowserWindow.getAllWindows().length === 0) this.createWindow();
+            });
+        });
+
+        app.on('window-all-closed', () => {
+            // Keep the app running even if all windows are closed (common for tray apps)
+            if (process.platform !== 'darwin') {
+                // Uncomment the next line if you want to quit the app when all windows are closed
+                // app.quit();
+            }
+        });
     }
 
-    public onExit(callback: () => void): void {
-        this.eventEmitter.on('exit', callback);
-    }
+    // /**
+    //  * Sends configuration data to the renderer process if needed.
+    //  * @param callback - The callback to handle IPC messages.
+    //  */
+    // setupIPC(): void {
+    //     ipcMain.on('request-config', (event) => {
+    //         event.sender.send('config-data', this.config);
+    //     });
+    // }
 }
 
-// -------------------------- Notification Handler -------------------------- //
-
-class NotificationHandler {
-    constructor() {}
-
-    public sendNotification(message: string): void {
-        new Notification({ title: 'AI Assistant Notification', body: message }).show();
-    }
-}
-
-// -------------------------- Main Application -------------------------- //
-
-class AI_Assistant_App {
-    private configManager: ConfigurationManager;
-    private logger: Logger;
-    private inputEventManager: InputEventManager;
-    private screenshotManager: ScreenshotManager;
-    private intentService: IntentInferenceService;
-    private assistantEngine: AssistantEngine;
-    private guiManager: GUIManager;
-    private notificationHandler: NotificationHandler;
-    private running: boolean = true;
+/**
+ * Configuration class holding all configurable parameters.
+ */
+class Config {
+    visionOllamaUrl: string;
+    visionModel: string;
+    nonVisionOllamaUrl: string;
+    nonVisionModel: string;
+    historyLimit: number;
+    analysisInterval: number;
+    intentInferenceInterval: number;
+    subRegion: Interfaces.SubRegion;
+    snapshotManager: SnapshotManager;
 
     constructor() {
-        this.configManager = new ConfigurationManager();
-        const config = this.configManager.getConfig();
+        this.visionOllamaUrl = Utils.getEnvString('VISION_OLLAMA_URL', 'http://localhost:11434/api/chat');
+        this.visionModel = Utils.getEnvString('VISION_MODEL', 'llava:7b');
+        this.nonVisionOllamaUrl = Utils.getEnvString('NON_VISION_OLLAMA_URL', 'http://localhost:11434/api/chat');
+        this.nonVisionModel = Utils.getEnvString('NON_VISION_MODEL', 'llava:7b');
+        this.historyLimit = Utils.getEnvNumber('HISTORY_LIMIT', 20);
+        this.analysisInterval = Utils.getEnvNumber('ANALYSIS_INTERVAL', 10000);
+        this.intentInferenceInterval = Utils.getEnvNumber('INTENT_INFERENCE_INTERVAL', 5);
 
-        this.logger = new Logger(
-            path.join(app.getPath('userData'), config.logging.file),
-            config.logging.level
-        );
+        this.subRegion = {
+            x: Utils.getEnvNumber('SUB_REGION_X', 0),
+            y: Utils.getEnvNumber('SUB_REGION_Y', 0),
+            width: Utils.getEnvNumber('SUB_REGION_WIDTH', 1920),
+            height: Utils.getEnvNumber('SUB_REGION_HEIGHT', 1080)
+        };
 
-        this.notificationHandler = new NotificationHandler();
-
-        this.inputEventManager = new InputEventManager(
-            config.assistant.inputEventBufferSize,
-            this.logger
-        );
-
-        this.screenshotManager = new ScreenshotManager(
-            config.assistant.screenshotBufferSize,
-            this.logger
-        );
-
-        this.intentService = new IntentInferenceService(
-            config.api.endpoint,
-            config.api.modelName,
-            config.api.apiKey,
-            this.logger
-        );
-
-        this.assistantEngine = new AssistantEngine(
-            this.notificationHandler.sendNotification.bind(this.notificationHandler),
-            this.logger
-        );
-
-        this.guiManager = new GUIManager();
-
-        this.setupExitHandler();
-    }
-
-    private setupExitHandler(): void {
-        this.guiManager.onExit(() => {
-            this.shutdown();
-        });
-
-        app.on('before-quit', () => {
-            this.shutdown();
-        });
-    }
-
-    private async assistantLoop(): Promise<void> {
-        const config = this.configManager.getConfig();
-        const captureIntervalMs = config.assistant.captureInterval * 1000;
-
-        while (this.running) {
-            // Capture screenshot
-            await this.screenshotManager.captureScreenshot();
-            const latestScreenshot = this.screenshotManager.getLatestScreenshot();
-
-            // Gather input events
-            const events = this.inputEventManager.getEvents();
-            this.inputEventManager.clearEvents();
-
-            // Infer intent
-            const intent = await this.intentService.inferIntent(latestScreenshot, events);
-
-            // Update GUI
-            this.guiManager.updateIntent(intent);
-            this.guiManager.updateNotification(intent);
-
-            // Handle intent
-            this.assistantEngine.handleIntent(intent);
-
-            // Wait for next interval
-            await this.sleep(captureIntervalMs);
-        }
-    }
-
-    private sleep(ms: number): Promise<void> {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    private shutdown(): void {
-        this.running = false;
-        // Stop all listeners based on platform
-        if (this.inputEventManager) {
-            if (platform === 'linux') {
-                this.inputEventManager['mouseListener'].close();
-                // For keyboard, since we're using readline, there's no explicit stop
-                // To gracefully exit, you might need to handle it differently
-            }
-            // Add conditions for other platforms if needed
-        }
-        this.logger.info('AI Assistant has been terminated.');
-        app.quit();
-    }
-
-    public async start(): Promise<void> {
-        await this.assistantLoop();
+        this.snapshotManager = new SnapshotManager(5, this.subRegion);
     }
 }
 
-// -------------------------- App Lifecycle -------------------------- //
-
-let aiAssistantApp: AI_Assistant_App | null = null;
-
-function createAppInstance(): AI_Assistant_App {
-    if (!aiAssistantApp) {
-        aiAssistantApp = new AI_Assistant_App();
-    }
-    return aiAssistantApp;
+// Generate control-panel.html if it doesn't exist
+const controlPanelPath = path.join(__dirname, 'control-panel.html');
+if (!fs.existsSync(controlPanelPath)) {
+    const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+        <head>
+            <title>Control Panel</title>
+            <style>
+                body { font-family: Arial, sans-serif; padding: 20px; }
+                #status { font-weight: bold; }
+            </style>
+        </head>
+        <body>
+            <h1>Screenshot Analyzer</h1>
+            <p>Status: <span id="status">Running</span></p>
+            <script>
+                window.electronAPI.onStatusUpdate((status) => {
+                    document.getElementById('status').innerText = status;
+                });
+            </script>
+        </body>
+    </html>
+    `;
+    fs.writeFileSync(controlPanelPath, htmlContent, { encoding: 'utf-8' });
 }
 
-app.whenReady().then(() => {
-    const appInstance = createAppInstance();
-    appInstance.start();
-
-    app.on('activate', () => {
-        if (BrowserWindow.getAllWindows().length === 0) {
-            // Re-create a window if none are open (macOS behavior)
-            // Not necessary here as we have GUIManager handling it
-        }
-    });
-});
-
-app.on('window-all-closed', () => {
-    // On non-macOS platforms, quit the app when all windows are closed
-    if (process.platform !== 'darwin') {
-        app.quit();
-    }
-});
+// Initialize and run the Electron application
+const config = new Config();
+const electronApp = new ElectronApp(config);
+// electronApp.setupIPC();
+electronApp.init();
